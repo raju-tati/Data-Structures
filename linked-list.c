@@ -1,249 +1,245 @@
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdbool.h>
+use Modern::Perl;
+use utf8;
+use POSIX;
+use EV;
+use AnyEvent;
+use Coro;
+use Coro::AnyEvent;
+use AnyEvent::Socket;
+use Coro::Handle;
+use Coro::AIO;
+use Digest::SHA1 qw(sha1);
+use Encode;
+use Bencode qw(bencode bdecode);
+use LWP::Simple qw(get);
+use Try::Tiny;
+use File::Path 'rmtree';
 
-struct node {
-   int data;
-   int key;
-   struct node *next;
+$| = 1;
+# implement a server
+
+sub file_content() {
+    my ($file) = @_;
+    my $contents;
+    open( my $fh, '<', $file ) or die "Cannot open torrent $file";
+    {
+        local $/;
+        $contents = <$fh>;
+    }
+    close($fh);
+    return $contents;
+}
+
+sub save_piece() {
+    my ($content, $name) = @_;
+    my $fh = aio_open "pieces/$name", O_WRONLY | O_TRUNC | O_CREAT, 0666 or warn "Error: $!";
+    aio_write $fh, 0, length($content), $content, 0 or warn "aio_write: $!";
+    aio_close $fh;
+}
+
+my $torrent_file = 'ubuntu-22.04.1-live-server-amd64.iso.torrent';
+my $torrent      = bdecode( file_content($torrent_file) );
+
+use Data::Printer;
+p $torrent;
+
+my $file_name    = $torrent->{'info'}->{'name'};
+my $file_length  = $torrent->{'info'}->{'length'};
+my $piece_length = $torrent->{'info'}->{'piece length'};
+
+my $info_hash  = Encode::encode( "ISO-8859-1", sha1( bencode( $torrent->{'info'} ) ) );
+my $announce   = $torrent->{'announce'};
+my $port       = 6881;
+my $left       = $torrent->{'info'}->{'length'};
+my $uploaded   = 0;
+my $downloaded = 0;
+my $peer_id    = "-AZ2200-6wfG2wk6wWLc";
+
+my $tracker_request =
+    $announce
+  . "?info_hash="
+  . $info_hash
+  . "&peer_id="
+  . $peer_id
+  . "&port="
+  . $port
+  . "&uploaded="
+  . $uploaded
+  . "&downloaded="
+  . $downloaded
+  . "&left="
+  . $left;
+
+  p($tracker_request);
+
+my $response = get($tracker_request) or die "Cannot connect to tracker";
+my $tracker_response = bdecode($response);
+
+my $peers = $tracker_response->{'peers'};
+p($peers);
+# $peers - {port, peert id, ip}
+
+my $pstr = "BitTorrent protocol";
+my $message = pack 'C1A*a8a20a20', length($pstr), $pstr, '',  $info_hash, $peer_id;
+
+my $bitfields_num = length($torrent->{'info'}->{'pieces'}) / 20;
+my $bitfield_num_bytes = 4 + 1 + ceil($bitfields_num / 8);
+
+# length - 4 bytes, id - 1 bytes,
+# $bitfields_num / 8 - bitfields bytes
+
+mkdir( 'pieces' );
+
+my $piece_channel = new Coro::Channel;
+for my $n (0..$bitfields_num - 1) {
+    $piece_channel->put($n);
+}
+
+for my $n (0..8) {
+    async {
+        tcp_connect $peers->[$n]->{'ip'}, $peers->[$n]->{'port'}, Coro::rouse_cb;
+        my $fh = unblock +(Coro::rouse_wait)[0];
+
+        my $buf;
+        my $bitfield;
+
+        try {
+            $fh->syswrite($message);
+        } catch {
+              terminate;
+        };
+
+        $fh->sysread($buf, length($message));
+        $fh->sysread($bitfield, $bitfield_num_bytes);
+
+        my ($pstr_r, $reserved_r, $info_hash_r, $peer_id_r, $c) = unpack 'C/a a8 a20 a20 a*', $buf;
+        my ($bitfield_length, $bitfield_id, $bitfield_data) = unpack 'N1 C1' . ' B' . $bitfields_num, $bitfield;
+
+        if( !defined($bitfield_data) || !defined($info_hash_r) ) {
+            terminate;
+        }
+
+        my @bitfield_array = split("", $bitfield_data);
+
+        if( $info_hash eq $info_hash_r ) {
+            my $interested = pack('Nc', 1, 2);
+            my $choke_buf;
+
+            $fh->syswrite($interested);
+            $fh->sysread($choke_buf, 5);
+
+            my ($length, $id) = unpack 'Nc', $choke_buf;
+            if( $id == 1 ) {
+                # Got Unchoke
+
+                PIECELOOP: {
+                    my $block_length = 2 ** 14;
+
+                    if( $piece_channel->size == 0 ) {
+                        terminate;
+                    }
+                    my $piece_index = $piece_channel->get;
+
+                    if( defined($bitfield_array[$piece_index]) && $bitfield_array[$piece_index] == 1 ) {
+                        # piece exists on the peer
+                        my $piece_data = '';
+                        my $piece_offset = 0;
+
+                        BLOCKLOOP: {
+                            my $block_buf;
+                            my $block_buf_size = 4 + 1 + 4 + 4 + $block_length;
+
+                            if( $piece_index == $bitfields_num - 1 ) {
+                                # handle last piece
+                                # $bitfields_num = number of pieces
+
+                                my $extra = ($bitfields_num * $piece_length) - $file_length;
+                                my $last_piece_length = $piece_length - $extra;
+
+                                if ( $piece_offset == $last_piece_length ) {
+                                    save_piece($piece_data, $piece_index);
+                                    goto PIECELOOP;
+                                }
+                            }
+
+                            if( $piece_offset == $piece_length ) {
+                                save_piece($piece_data, $piece_index);
+                                goto PIECELOOP;
+                            }
+
+                            my $request_pack = pack 'NNN', $piece_index, $piece_offset, $block_length;
+                            my $request = pack 'Nca*', length($request_pack) + 1, 6, $request_pack;
+
+                            $fh->syswrite($request);
+                            $fh->sysread($block_buf, $block_buf_size);
+
+                            my ($r_block_length, $r_block_id, $r_block_pack) = unpack 'Nca*', $block_buf;
+                            my $r_block_data_length = 16384; #($r_block_length - 9);
+                            my $unpack = 'N N'. ' a' . $r_block_data_length;
+                            my ($r_block_index, $r_block_offset, $r_block_data) = unpack $unpack, $r_block_pack;
+
+                            $piece_data = $piece_data . $r_block_data;
+                            $piece_offset = $piece_offset + $block_length;
+
+                            # ...
+                            goto BLOCKLOOP;
+                        }
+                    }
+                    else {
+                        # put back piece_index on piece channel
+                        # let other workers download it
+                        Coro::AnyEvent::sleep 1;
+                        $piece_channel->put($piece_index);
+                        goto PIECELOOP;
+                    }
+                }
+            }
+            elsif( $id == 0 ) {
+                # Got Choke
+                terminate;
+            }
+        }
+    };
+}
+
+async {
+    while (1) {
+        Coro::AnyEvent::sleep 60;
+
+        if( $piece_channel->size == 0 ) {
+            say "Your download will complete in 5 minutes";
+            Coro::AnyEvent::sleep 300;
+            # wait 5 minutes for the running Coro's to terminate
+
+            opendir(Dir, 'pieces') || die "Can't open directory pieces: $!\n";
+            my @list = readdir(Dir);
+            closedir(Dir);
+
+            shift(@list);
+            shift(@list);
+
+            my @sort_files = sort { $a <=> $b } @list;
+            my $data = '';
+
+            for my $file (0..$#sort_files) {
+                my $file_piece_content = file_content( 'pieces/' . $sort_files[$file]);
+                $data = $data . $file_piece_content;
+            }
+
+            open ( my $of, '>', $file_name) or die "Cannot write to $file_name";
+            print $of $data;
+            close($of);
+
+            rmtree([ "pieces" ]);
+
+            say "Download Complete";
+
+            # https://askubuntu.com/questions/329704/syslinux-no-default-or-ui-configuration-directive-found
+
+            terminate;
+        }
+    }
 };
 
-struct node *head = NULL;
-struct node *current = NULL;
-
-//display the list
-void printList() {
-   struct node *ptr = head;
-   printf("\n[ ");
-
-   //start from the beginning
-   while(ptr != NULL) {
-      printf("(%d,%d) ",ptr->key,ptr->data);
-      ptr = ptr->next;
-   }
-
-   printf(" ]");
-}
-
-//insert link at the first location
-void insertFirst(int key, int data) {
-   //create a link
-   struct node *link = (struct node*) malloc(sizeof(struct node));
-
-   link->key = key;
-   link->data = data;
-
-   //point it to old first node
-   link->next = head;
-
-   //point first to new first node
-   head = link;
-}
-
-//delete first item
-struct node* deleteFirst() {
-
-   //save reference to first link
-   struct node *tempLink = head;
-
-   //mark next to first link as first
-   head = head->next;
-
-   //return the deleted link
-   return tempLink;
-}
-
-//is list empty
-bool isEmpty() {
-   return head == NULL;
-}
-
-int length() {
-   int length = 0;
-   struct node *current;
-
-   for(current = head; current != NULL; current = current->next) {
-      length++;
-   }
-
-   return length;
-}
-
-//find a link with given key
-struct node* find(int key) {
-
-   //start from the first link
-   struct node* current = head;
-
-   //if list is empty
-   if(head == NULL) {
-      return NULL;
-   }
-
-   //navigate through list
-   while(current->key != key) {
-
-      //if it is last node
-      if(current->next == NULL) {
-         return NULL;
-      } else {
-         //go to next link
-         current = current->next;
-      }
-   }
-
-   //if data found, return the current Link
-   return current;
-}
-
-//delete a link with given key
-struct node* delete(int key) {
-
-   //start from the first link
-   struct node* current = head;
-   struct node* previous = NULL;
-
-   //if list is empty
-   if(head == NULL) {
-      return NULL;
-   }
-
-   //navigate through list
-   while(current->key != key) {
-
-      //if it is last node
-      if(current->next == NULL) {
-         return NULL;
-      } else {
-         //store reference to current link
-         previous = current;
-         //move to next link
-         current = current->next;
-      }
-   }
-
-   //found a match, update the link
-   if(current == head) {
-      //change first to point to next link
-      head = head->next;
-   } else {
-      //bypass the current link
-      previous->next = current->next;
-   }
-
-   return current;
-}
-
-void sort() {
-
-   int i, j, k, tempKey, tempData;
-   struct node *current;
-   struct node *next;
-
-   int size = length();
-   k = size ;
-
-   for ( i = 0 ; i < size - 1 ; i++, k-- ) {
-      current = head;
-      next = head->next;
-
-      for ( j = 1 ; j < k ; j++ ) {
-
-         if ( current->data > next->data ) {
-            tempData = current->data;
-            current->data = next->data;
-            next->data = tempData;
-
-            tempKey = current->key;
-            current->key = next->key;
-            next->key = tempKey;
-         }
-
-         current = current->next;
-         next = next->next;
-      }
-   }
-}
-
-void reverse(struct node** head_ref) {
-   struct node* prev   = NULL;
-   struct node* current = *head_ref;
-   struct node* next;
-
-   while (current != NULL) {
-      next  = current->next;
-      current->next = prev;
-      prev = current;
-      current = next;
-   }
-
-   *head_ref = prev;
-}
-
-void main() {
-   insertFirst(1,10);
-   insertFirst(2,20);
-   insertFirst(3,30);
-   insertFirst(4,1);
-   insertFirst(5,40);
-   insertFirst(6,56);
-
-   printf("Original List: ");
-
-   //print list
-   printList();
-
-   while(!isEmpty()) {
-      struct node *temp = deleteFirst();
-      printf("\nDeleted value:");
-      printf("(%d,%d) ",temp->key,temp->data);
-   }
-
-   printf("\nList after deleting all items: ");
-   printList();
-   insertFirst(1,10);
-   insertFirst(2,20);
-   insertFirst(3,30);
-   insertFirst(4,1);
-   insertFirst(5,40);
-   insertFirst(6,56);
-
-   printf("\nRestored List: ");
-   printList();
-   printf("\n");
-
-   struct node *foundLink = find(4);
-
-   if(foundLink != NULL) {
-      printf("Element found: ");
-      printf("(%d,%d) ",foundLink->key,foundLink->data);
-      printf("\n");
-   } else {
-      printf("Element not found.");
-   }
-
-   delete(4);
-   printf("List after deleting an item: ");
-   printList();
-   printf("\n");
-   foundLink = find(4);
-
-   if(foundLink != NULL) {
-      printf("Element found: ");
-      printf("(%d,%d) ",foundLink->key,foundLink->data);
-      printf("\n");
-   } else {
-      printf("Element not found.");
-   }
-
-   printf("\n");
-   sort();
-
-   printf("List after sorting the data: ");
-   printList();
-
-   reverse(&head);
-   printf("\nList after reversing the data: ");
-   printList();
-}
+cede;
+EV::loop();
