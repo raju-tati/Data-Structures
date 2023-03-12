@@ -1,93 +1,131 @@
 #include<stdio.h>
-#include<stdlib.h>
 
 struct node {
-		int value;
-		struct node* next;
+    int data;
+    struct node* link;
 };
 
-struct node* head;
+/// @brief add at the end of the list
+/// @param q list q
+/// @param num number to add
+append(struct node **q, int num) {
+    struct node *temp, *r;
+    temp = *q;
 
-void init() {
-		head = NULL;
+    if(*q == NULL) {
+        temp = malloc(sizeof(struct node));
+        temp->data = num;
+        temp->link = NULL;
+        *q = temp;
+    } else {
+        temp = *q;
+        while(temp->link != NULL) {
+            temp = temp->link;
+        }
+
+        r = malloc(sizeof(struct node));
+        r->data = num;
+        r->link = NULL;
+        temp->link = r;
+    }
 }
 
-void insertFirst(int element) {
-		struct node* newNode = malloc(sizeof(struct node));
-		newNode->value = element;
-		newNode->next = head;
-		head = newNode;
+addAtBegin(struct node **q, int num) {
+    struct node *temp;
+    temp = malloc(sizeof( struct node));
+    temp->data = num;
+    temp->link = *q;
+    *q = temp;
 }
 
-void deleteFirst() {
-		struct node* current = malloc(sizeof(struct node));
-		current = head;
-		head = head->next;
-		free(current);
+addAfter(struct node *q, int loc, int num) {
+    struct node *temp, *r;
+    int i;
+    temp = q;
+
+    for(i = 0; i< loc; i++) {
+        temp = temp->link;
+        if(temp == NULL) {
+            printf("\n there are less than %d elements in list", loc);
+            return;
+        }
+    }
+
+    r = malloc(sizeof(struct node));
+    r->data = num;
+    r->link = temp->link;
+    temp->link = r;
 }
 
-void deleteLast() {
-		struct node* current = malloc(sizeof(struct node));
-		struct node* previous = malloc(sizeof(struct node));
+display(struct node *q) {
+    printf("\n");
 
-		current = head;
-		while(current->next != NULL) {
-				previous = current;
-				current = current->next;
-		}
-
-		if(previous->next != NULL) {
-				previous->next = NULL;
-		}
-
-		free(current);
+    while(q != NULL) {
+        printf("%d", q->data);
+        q = q->link;
+    }
 }
 
-void insertLast(int element) {
-		struct node* newNode = malloc(sizeof(struct node));
-		struct node* temp = malloc(sizeof(struct node));
-
-		newNode->value = element;
-		newNode->next = NULL;
-
-		temp = head;
-		while(temp->next != NULL) {
-				temp = temp->next;
-		}
-
-		temp->next = newNode;
+count(struct node *q) {
+    int c = 0;
+    while( q != NULL) {
+        q = q->link;
+        c++;
+    } 
+    return c;
 }
 
-void print() {
-		if(head == NULL) {
-				printf("list is empty\n");
-				return;
-		}
+delete (struct node **q, int num) {
+    struct node *old, *temp;
+    temp = *q;
 
-		struct node *current = head;
-		int count = 0;
-		while(current != NULL) {
-				printf("%d->\n", current->value);
-				count++;
-				current = current->next;
-		}
-		printf("number of nodes %d", count);
+    while(temp != NULL) {
+        if(temp->data == num) {
+            if(temp == *q) {
+                *q = temp->link;
+                free(temp);
+                return;
+            }
+            else {
+                old->link = temp->link;
+                free(temp);
+                return;
+            }
+        }
+        else {
+            old = temp;
+            temp = temp->link;
+        }
+    }
+    printf("\nElement %d not found", num);
 }
 
 int main() {
-		init();
+    struct node* p;
+    p = NULL;
 
-		int value = 1;
-		insertFirst(value);
+    append(&p, 1);
+    append(&p, 2);
+    append(&p, 3);
+    append(&p, 4);
 
-		int value2 = 2;
-		insertFirst(value2);
+    display(p);
 
-		int value3 = 3;
-		insertLast(value3);
+    addAtBegin(&p, 999);
+    addAtBegin(&p, 888);
+    addAtBegin(&p, 777);
 
-		deleteFirst();
-		deleteLast();
+    display(p);
 
-		print();
+    addAfter(p, 7, 21);
+    addAfter(p, 2, 22);
+    addAfter(p, 3, 23);
+
+    display(p);
+
+    delete(&p, 888);
+    delete(&p, 1);
+    delete(&p, 22);
+
+    display(p);
 }
